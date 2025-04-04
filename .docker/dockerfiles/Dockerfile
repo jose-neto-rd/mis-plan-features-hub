@@ -1,0 +1,70 @@
+# Usar uma imagem oficial do Go para compilação
+FROM golang:1.22 AS builder
+
+# Definir diretório de trabalho
+WORKDIR /usr/mis-plan-features-hub/app
+
+# Definição de argumentos para credenciais do Artifactory
+ARG JFROG_USERNAME
+ARG JFROG_PASSWORD
+
+# Configurar proxy para baixar dependências
+ENV GOPRIVATE="github.com/ResultadosDigitais,go.uber.org"
+ENV GONOSUMDB="github.com/ResultadosDigitais/*,go.uber.org/*"
+ENV GONOPROXY="go.uber.org/*"
+ENV GOPROXY="https://${JFROG_USERNAME}:${JFROG_PASSWORD}@resultadosdigitais.jfrog.io/artifactory/api/go/go,direct"
+
+# Instalar dependências do sistema
+RUN apt-get update && apt-get install -y telnet curl htop git make && rm -rf /var/lib/apt/lists/*
+
+# Configurar credenciais para acessar repositórios privados
+RUN echo "machine github.com\n\
+    login ${JFROG_USERNAME}\n\
+    password ${JFROG_PASSWORD}\n\
+    \n\
+    machine resultadosdigitais.jfrog.io\n\
+    login ${JFROG_USERNAME}\n\
+    password ${JFROG_PASSWORD}" > /root/.netrc && chmod 600 /root/.netrc
+
+# Copiar apenas os arquivos do módulo do Go (go.mod e go.sum)
+COPY go.mod go.sum ./
+
+# Baixar dependências e corrigir possíveis erros ANTES de copiar o código-fonte
+RUN go mod tidy && go mod download
+
+# Copiar o código-fonte
+COPY . .
+
+# Forçar remoção do go.sum para evitar conflitos
+RUN rm -f go.sum && go mod tidy && go mod vendor
+
+# Rodar o build
+RUN go build -v -o mis-plan-features-hub cmd/main.go
+
+# Criar uma imagem mais leve para execução
+FROM golang:1.22 AS runtime
+
+# Definir diretório de trabalho
+WORKDIR /usr/mis-plan-features-hub/app
+
+# Instalar Telnet, Curl e Htop na imagem final
+RUN apt-get update && apt-get install -y telnet curl htop && rm -rf /var/lib/apt/lists/*
+
+# Copiar o binário compilado da imagem anterior
+COPY --from=builder /usr/mis-plan-features-hub/app/mis-plan-features-hub .
+
+# Criar um script de entrada (entrypoint.sh)
+RUN echo '#!/bin/sh\n\
+echo "Running go mod tidy..."\n\
+go mod tidy\n\
+echo "Starting the service..."\n\
+exec /usr/mis-plan-features-hub/app/mis-plan-features-hub' > /usr/mis-plan-features-hub/app/entrypoint.sh
+
+# Dar permissão de execução ao script
+RUN chmod +x /usr/mis-plan-features-hub/app/entrypoint.sh
+
+# Expor a porta da aplicação
+EXPOSE 3000
+
+# Usar o script como entrypoint
+ENTRYPOINT ["/usr/mis-plan-features-hub/app/entrypoint.sh"]

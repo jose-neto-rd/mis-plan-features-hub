@@ -1,0 +1,25 @@
+version: '3.8'
+services:
+  mis-plan-features-hub:
+    build:
+      context: .
+      dockerfile: .docker/dockerfiles/Dockerfile
+      args:
+        - JFROG_USERNAME=${JFROG_USERNAME}
+        - JFROG_PASSWORD=${JFROG_PASSWORD}
+    container_name: mis-plan-features-hub
+    entrypoint: sh ./entrypoint.sh
+    restart: always
+    tty: true
+    ports:
+      - 3010:3000
+      - 50055:50050
+    environment:
+      ENVIRONMENT: "development"
+      SERVICE_PORT: 3000
+      SERVICE_HOST: 0.0.0.0
+      GRPC_PORT: 50050
+      DD_ENV: "development"
+      DD_MONITORING_ENABLED: "false"
+      INSTANCE_ID: "false"
+      DD_SERVICE: "mis-plan-features-hub"

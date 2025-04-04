@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package planFeature;
+
+option go_package = "./plan-feature";
+
+service PlanFeature {
+  rpc Allowed (AllowedRequest) returns (AllowedResponse);
+}
+
+message AllowedRequest {
+  string plan = 1;
+  string feature = 2;
+}
+
+message AllowedResponse {
+  bool allowed = 1;
+}

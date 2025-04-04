@@ -1,0 +1,341 @@
+def apiUrl
+def mr
+def appName
+def userInput
+pipeline {
+    agent any
+    options {
+        /// Configuração para descarte de builds e para manter apenas a última build
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+    }
+    parameters {
+        string(name: 'BRANCH_NAME', description: 'Informe o nome de sua branch')
+        string(name: 'MR_NUMBER_GITLAB', description: 'Informe o número do seu MR do Gitlab')
+        booleanParam(name: 'DEPLOY_MAIN', defaultValue: false, description: 'Fazer apenas o deploy da main')
+        booleanParam(name: 'SKIP_PRECONDITION', defaultValue: false, description: 'Pular a verificação da branch? Atenção, só escolha essa opção se você souber o que está fazendo.')
+    }
+    environment {
+        // Project
+        PROJECT_NAME = 'mis-plan-features-hub'
+        PROJECT_PATH = 'tallos%2Fdevelopment%2Ftallos-chat%2Fsupport%2F'
+        PROJECT_TAG = '1.0.0'
+        // Docker
+        DOCKER_ECR_URL = credentials('ecr_url')
+        DOCKER_ECR_REGION = credentials('ecr_region')
+        DOCKER_ECR_CREDENTIAL_ID = 'aws_credential'
+        // Gitlab
+        GITLAB_URL = credentials('gitlab_url')
+        GITLAB_USER = credentials('gitlab_user')
+        GITLAB_TOKEN = credentials('gitlab_token')
+        // Slack
+        SLACK_CHANNEL = credentials('slack_channel')
+        SLACK_TOKEN = credentials('slack_token')
+        // Sonar
+        SCANNERHOME = tool 'SONAR_SC'
+        SONAR_URL = credentials('sonar_url')
+        SONAR_DNS = credentials('sonar_dns')
+        //// ArgoCD
+        ARGOCD_CONTEXT = 'production'
+        // JFrog credentials
+        JFROG_USERNAME = credentials('jfrog_username')
+        JFROG_PASSWORD = credentials('jfrog_password')
+    }
+    stages {
+        stage('Verificar a Branch') {
+            when {
+                expression { params.DEPLOY_MAIN == false }
+            }
+            steps {
+                script {
+                    apiUrl = "${GITLAB_URL}/api/v4/projects/${PROJECT_PATH}${PROJECT_NAME}/merge_requests/" + params.MR_NUMBER_GITLAB
+                    def response = httpRequest(
+                        url: apiUrl,
+                        httpMode: 'GET',
+                        customHeaders: [[name: 'PRIVATE-TOKEN', value: env.GITLAB_TOKEN]],
+                        consoleLogResponseBody: true
+                    )
+                    mr = readJSON text: response.content
+
+                    echo "Upvotes: ${mr.upvotes}"
+                    echo "Source Branch: ${mr.state}"
+                    echo "targetBranch: ${mr.target_branch}"
+                    echo "stateBranch: ${mr.source_branch}"
+
+                    echo 'Verificação Branch'
+                    if (!params.SKIP_PRECONDITION) {
+                        if (params.MR_NUMBER_GITLAB == null || params.MR_NUMBER_GITLAB.trim() == '') {
+                            error 'Por favor, especifique o número do seu MR do projeto ao iniciar o pipeline.'
+                        }
+
+                        if (mr.upvotes < 2) {
+                            error 'O MR não possui os votos necessários para ser aprovado.'
+                        }
+
+                        if (mr.state != 'opened') {
+                            error 'O MR não está aberto.'
+                        }
+
+                        if (mr.target_branch != 'main') {
+                            error 'O seu MR deve ser mergeado para main.'
+                        }
+                    }
+
+                    if (mr.source_branch != params.BRANCH_NAME) {
+                        error 'O nome da branch do MR não corresponde ao nome da branch do pipeline.'
+                    }
+                }
+            }
+        }
+        stage('Atualizar a Branch') {
+            when {
+                expression { params.DEPLOY_MAIN == false }
+            }
+            steps {
+                script {
+                    checkout([$class: 'GitSCM', branches: [[name: "origin/${mr.source_branch}"]]])
+                    sh "git merge origin/${mr.target_branch}"
+                }
+            }
+        }
+        stage ('Teste Sonar') {
+            when {
+                expression { params.DEPLOY_MAIN == false }
+            }
+            steps {
+                withCredentials([string(credentialsId: 'sonar_token', variable: 'TOKEN')]) {
+                    withSonarQubeEnv('SONAR') {
+                        sh """
+                            ${SCANNERHOME}/bin/sonar-scanner -e \
+                            -Dsonar.projectKey=${PROJECT_NAME} \
+                            -Dsonar.sources=. \
+                            -Dsonar.projectVersion=${PROJECT_TAG}-${env.BUILD_NUMBER} \
+                            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                            -Dsonar.host.url=${SONAR_URL} \
+                            -Dsonar.login=$TOKEN
+                        """
+                    }
+                }
+            }
+        }
+        stage('Teste Quality Gate') {
+            when {
+                expression { params.DEPLOY_MAIN == false }
+            }
+            steps {
+                sleep(20)
+                timeout(time: 1, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+        stage('Construindo imagem Docker') {
+            steps {
+                script {
+                    dockerImage = docker.build("${DOCKER_ECR_URL}/${PROJECT_NAME}:${PROJECT_TAG}.${BUILD_NUMBER}", "--no-cache --build-arg JFROG_USERNAME=${JFROG_USERNAME} --build-arg JFROG_PASSWORD=${JFROG_PASSWORD} -f ./.docker/dockerfiles/Dockerfile.prod .")
+                }
+            }
+        }
+        stage('Push da imagem') {
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_ECR_URL}/${PROJECT_NAME}:${PROJECT_TAG}.${BUILD_NUMBER}", "ecr:${DOCKER_ECR_REGION}:${DOCKER_ECR_CREDENTIAL_ID}") {
+                        dockerImage.push()
+                    }
+                }
+            }
+        }
+        stage('Checkout repositório manifestos Kubernetes') {
+            steps {
+                dir("/tmp/${PROJECT_NAME}/${BUILD_NUMBER}/kubernetes") {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: 'production']],
+                        userRemoteConfigs: [[url: "https://${GITLAB_USER}:${GITLAB_TOKEN}@repo.tallos.com.br/tallos/development/tallos-chat/devops/kubernetes.git"]]
+                    ])
+                }
+            }
+        }
+        stage('Kustomize Apply') {
+            steps {
+                dir("/tmp/${PROJECT_NAME}/${BUILD_NUMBER}/kubernetes/apps/${PROJECT_NAME}") {
+                    sh """
+                        kustomize edit set image image=${DOCKER_ECR_URL}/${PROJECT_NAME}:${PROJECT_TAG}.${BUILD_NUMBER}
+                    """
+                }
+            }
+        }
+        stage('Commit repositório manifestos Kubernetes') {
+            steps {
+                dir("/tmp/${PROJECT_NAME}/${BUILD_NUMBER}/kubernetes") {
+                    sh """
+                        git checkout production
+                        git add .
+                        git commit -m 'Commit performed automatically by Jenkins - ${PROJECT_NAME} Job ${BUILD_NUMBER}'
+                        git push origin production
+                    """
+                }
+            }
+        }
+        stage('Sincronizar aplicação no ArgoCD') {
+            steps {
+                script {
+                    appName = "${PROJECT_NAME}"
+                    def argoContext = "${ARGOCD_CONTEXT}"
+                    echo "Iniciando sincronização da aplicação '$appName' no ArgoCD..."
+
+                    try {
+                        sh """
+                        argocd context ${argoContext} | argocd app sync $appName --grpc-web
+                    """
+                        echo "Sincronização iniciada com sucesso para a aplicação '$appName'."
+                } catch (Exception e) {
+                        error "Erro durante a sincronização da aplicação no ArgoCD: ${e.message}"
+                    }
+                }
+            }
+        }
+        stage('Verificar versão e estado da aplicação no ArgoCD') {
+            steps {
+                script {
+                    def targetImage = "${DOCKER_ECR_URL}/${PROJECT_NAME}:${PROJECT_TAG}.${BUILD_NUMBER}"
+                    def timeoutMinutes = 5
+                    def intervalSeconds = 15
+                    def maxChecks = (timeoutMinutes * 60) / intervalSeconds
+                    def checks = 0
+                    def success = false
+
+                    echo "Iniciando verificação de versão e estado da aplicação '$appName' no ArgoCD..."
+
+                    while (checks < maxChecks) {
+                        def appDetails = sh(
+                        script: "argocd app get $appName --output json --grpc-web",
+                        returnStdout: true
+                    ).trim()
+
+                        def appInfo = readJSON text: appDetails
+                        def deployedImage = appInfo.status.summary.images[0]
+                        def healthStatus = appInfo.status.health.status
+                        def syncStatus = appInfo.status.sync.status
+
+                        // Verificar imagem
+                        if (deployedImage?.contains(targetImage)) {
+                            echo "A versão ${targetImage} foi deployada com sucesso no ArgoCD."
+                    } else {
+                            echo "A versão ${targetImage} ainda não foi deployada. Aguardando..."
+                            sleep(intervalSeconds)
+                            checks++
+                            continue
+                        }
+
+                        // Verificar estado de saúde
+                        if (healthStatus == 'Healthy') {
+                            echo "A aplicação está com o estado de saúde 'Healthy'."
+                    } else {
+                            echo "A aplicação não está 'Healthy'. Status atual: ${healthStatus}"
+                            sleep(intervalSeconds)
+                            checks++
+                            continue
+                        }
+
+                        // Verificar status de sincronização
+                        if (syncStatus == 'Synced') {
+                            echo 'A aplicação está sincronizada com sucesso.'
+                            success = true
+                            break
+                    } else {
+                            echo "A aplicação não está sincronizada. Status atual: ${syncStatus}"
+                            sleep(intervalSeconds)
+                            checks++
+                        }
+                    }
+
+                    if (!success && checks >= maxChecks) {
+                        error 'Tempo limite atingido. A aplicação não está na versão esperada ou não foi sincronizada corretamente.'
+                    }
+                }
+            }
+        }
+        stage('Rollback ou Merge') {
+            when {
+              expression { params.DEPLOY_MAIN == false }
+            }
+            steps {
+                script {
+                    try {
+                        userInput = input(
+                            id: 'userInput',
+                            message: 'Escolha uma opção',
+                            parameters: [
+                                choice(name: 'OPCAO', choices: ['Fazer o Rollback', 'Fazer o Merge'], description: 'Escolha uma opção')
+                            ]
+                        )
+                    } catch (Exception abortException) {
+                        echo 'Pipeline abortado pelo usuário'
+                        currentBuild.result = 'ABORTED'
+                    }
+                }
+            }
+        }
+
+        stage('Rollback') {
+            when {
+                expression { (userInput == 'Fazer o Rollback' || currentBuild.result == 'ABORTED') && params.DEPLOY_MAIN != true }
+            }
+            steps {
+                script {
+                    echo 'Iniciando rollback da aplicação e revertendo MR de manifestos Kubernetes...'
+
+                    // Rollback da aplicação via ArgoCD
+                    echo 'Fazendo rollback da aplicação no ArgoCD...'
+                    try {
+                        // Faz rollback para a versão anterior da aplicação
+                        sh """
+                    argocd app rollback ${PROJECT_NAME} --grpc-web
+                """
+                        echo 'Rollback da aplicação realizado com sucesso.'
+            } catch (Exception e) {
+                        error "Erro durante o rollback da aplicação no ArgoCD: ${e.message}"
+                    }
+
+                    // Checkout do repositório manifestos Kubernetes
+                    echo 'Revertendo MR de manifestos Kubernetes...'
+                    dir("/tmp/${PROJECT_NAME}/${BUILD_NUMBER}/kubernetes") {
+                        // Reverte o commit mais recente, criando um novo commit para desfazê-lo
+                        sh '''
+                    git checkout production
+                    git revert --no-commit HEAD
+                    git commit -m "Revertendo MR de manifestos Kubernetes"
+                    git push origin production
+                    '''
+                    }
+
+                    echo 'MR de manifestos Kubernetes revertido com sucesso.'
+                }
+            }
+        }
+
+        stage('Merge') {
+            when {
+                expression { userInput == 'Fazer o Merge' && params.DEPLOY_MAIN != true }
+            }
+            steps {
+                script {
+                    echo 'Fazendo o merge do MR'
+                    sh """
+                        curl --request PUT --header 'PRIVATE-TOKEN: ${GITLAB_TOKEN}' '$apiUrl/merge'
+                    """
+                }
+            }
+        }
+        stage('Removendo repositório manifestos Kubernetes') {
+            steps {
+                sh " rm -rf /tmp/${PROJECT_NAME}"
+            }
+        }
+    }
+    post {
+        always {
+            sh "docker rmi ${DOCKER_ECR_URL}/${PROJECT_NAME}:${PROJECT_TAG}.${BUILD_NUMBER}"
+        }
+    }
+}

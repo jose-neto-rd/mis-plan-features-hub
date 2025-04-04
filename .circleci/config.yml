@@ -1,0 +1,109 @@
+version: 2.1
+
+orbs:
+  gcp-gcr: circleci/gcp-gcr@0.16.9
+
+parameters:
+  service_name:
+    type: string
+    default: "rdsc-mis-plan-features-hub"
+  repository_name:
+    type: string
+    default: "conversas"
+  dockerfile_path:
+    type: string
+    default: ".docker/dockerfiles/Dockerfile.prod"
+  deploy_path:
+    type: string
+    default: "rdsc-kubernetes-manifests/apps/mis-plan-features-hub"
+
+jobs:
+  build-and-push-image:
+    parameters:
+      manifests_branch:
+        type: string
+    executor: gcp-gcr/default
+    environment:
+      GOOGLE_COMPUTE_ZONE: us-central1-a
+    steps:
+      - checkout
+      - gcp-gcr/gcr-auth:
+          registry-url: us-central1-docker.pkg.dev
+          gcloud-service-key: GCLOUD_SERVICE_KEY
+      - gcp-gcr/build-image:
+          image: << pipeline.parameters.service_name >>
+          tag: ${CIRCLE_SHA1::7}
+          dockerfile: << pipeline.parameters.dockerfile_path >>
+          repository: << pipeline.parameters.repository_name >>
+          registry-url: us-central1-docker.pkg.dev
+          extra_build_args: "--build-arg JFROG_USERNAME=${JFROG_USERNAME} --build-arg JFROG_PASSWORD=${JFROG_PASSWORD}"
+      - gcp-gcr/push-image:
+          image: << pipeline.parameters.service_name >>
+          tag: ${CIRCLE_SHA1::7}
+          registry-url: us-central1-docker.pkg.dev
+          repository: << pipeline.parameters.repository_name >>
+      - gcp-gcr/tag-image:
+          image: << pipeline.parameters.service_name >>
+          source-tag: ${CIRCLE_SHA1::7}
+          target-tag: << parameters.manifests_branch >>
+          registry-url: us-central1-docker.pkg.dev
+          repository: << pipeline.parameters.repository_name >>
+      - store_artifacts:
+          path: /tmp/artifacts
+          destination: artifacts
+
+  commit-git-changes:
+    parameters:
+      manifests_branch:
+        type: string
+    docker:
+      - image: circleci/python:3.9
+    steps:
+      - checkout
+      - run:
+          name: "Atualizar imagem no kustomization.yaml"
+          command: |
+            git clone --branch << parameters.manifests_branch >> https://${GITHUB_TOKEN}@github.com/ResultadosDigitais/rdsc-kubernetes-manifests.git
+            cd << pipeline.parameters.deploy_path >>
+            sed -i "s|newTag: .*|newTag: ${CIRCLE_SHA1::7}|" kustomization.yaml
+            git config --local user.email "ci-bot@seu-dominio.com"
+            git config --local user.name "CI Bot"
+            git commit -am "Atualizando imagem para ${CIRCLE_SHA1::7} [ci skip]"
+            git push https://${GITHUB_TOKEN}@github.com/ResultadosDigitais/rdsc-kubernetes-manifests.git HEAD:<< parameters.manifests_branch >>
+
+workflows:
+  staging:
+    when:
+      not:
+        equal: [ main, << pipeline.git.branch >> ] 
+    jobs:
+      - deploy-app:
+          type: approval
+      - build-and-push-image:
+          manifests_branch: "staging"
+          context:
+            - rd-conversas-stg
+          requires:
+            - deploy-app
+      - commit-git-changes:
+          manifests_branch: "staging"
+          requires:
+            - build-and-push-image
+          context:
+            - rd-conversas-stg
+
+  production:
+    when:
+      and:
+        - equal: [ main, << pipeline.git.branch >> ]  
+    jobs:
+      - build-and-push-image:
+          manifests_branch: "production"
+          context:
+            - rd-conversas-prd
+      - commit-git-changes:
+          manifests_branch: "production"
+          requires:
+            - build-and-push-image
+          context:
+            - rd-conversas-prd
